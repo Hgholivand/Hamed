@@ -14,6 +14,19 @@ import json
 import urllib.request
 
 
+def _load_env():
+    env = {}
+    try:
+        for line in open("/home/ubuntu/.market_env").read().strip().split("\n"):
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return env
+
+
 def fetch(ticker):
     try:
         import yfinance as yf
@@ -140,7 +153,10 @@ def fetch_fear_greed():
 
 def fetch_insider_trades(ticker):
     try:
-        key = open("/home/ubuntu/.market_env").read().strip().split("=")[1]
+        env = _load_env()
+        key = env.get("FINNHUB_API_KEY", "")
+        if not key:
+            return {"error": "FINNHUB_API_KEY not set in /home/ubuntu/.market_env"}
         url = f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={ticker}&token={key}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -172,15 +188,13 @@ def fetch_insider_trades(ticker):
 def fetch_alpha_vantage_sentiment(ticker):
     """News sentiment via Alpha Vantage free tier (25 calls/day, no card needed)."""
     try:
-        env = {}
-        for line in open("/home/ubuntu/.market_env").read().strip().split("\n"):
-            if "=" in line:
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip()
+        env = _load_env()
         key = env.get("ALPHA_VANTAGE_KEY", "")
         if not key:
             return {"error": "ALPHA_VANTAGE_KEY not set in /home/ubuntu/.market_env"}
-        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={ticker}&limit=10&apikey={key}"
+        # Alpha Vantage uses base ticker without exchange suffix (SHOP not SHOP.TO)
+        av_ticker = ticker.split(".")[0] if "." in ticker else ticker
+        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={av_ticker}&limit=10&apikey={key}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read())
@@ -191,7 +205,7 @@ def fetch_alpha_vantage_sentiment(ticker):
         overall_scores = []
         for a in articles:
             ticker_sentiment = next(
-                (t for t in a.get("ticker_sentiment", []) if t["ticker"] == ticker), None
+                (t for t in a.get("ticker_sentiment", []) if t["ticker"] == av_ticker), None
             )
             score = float(ticker_sentiment["ticker_sentiment_score"]) if ticker_sentiment else 0.0
             overall_scores.append(score)
@@ -206,6 +220,7 @@ def fetch_alpha_vantage_sentiment(ticker):
         label = "Bullish" if avg > 0.15 else ("Bearish" if avg < -0.15 else "Neutral")
         return {
             "ticker": ticker,
+            "av_ticker_used": av_ticker,
             "avg_sentiment_score": avg,
             "sentiment_label": label,
             "articles": results
@@ -216,28 +231,28 @@ def fetch_alpha_vantage_sentiment(ticker):
 
 def fetch_fred_macro():
     """US macro indicators from FRED (free, no API key required)."""
-    try:
-        series = {
-            "fed_funds_rate": "FEDFUNDS",
-            "cpi_yoy": "CPIAUCSL",
-            "unemployment": "UNRATE",
-            "10y_treasury": "GS10",
-            "us_gdp_growth": "A191RL1Q225SBEA",
-        }
-        results = {}
-        for label, sid in series.items():
+    series = {
+        "fed_funds_rate": "FEDFUNDS",
+        "cpi_yoy": "CPIAUCSL",
+        "unemployment": "UNRATE",
+        "10y_treasury": "GS10",
+        "us_gdp_growth": "A191RL1Q225SBEA",
+    }
+    results = {}
+    for label, sid in series.items():
+        try:
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=25) as r:
                 lines = r.read().decode().strip().split("\n")
             for line in reversed(lines[1:]):
                 parts = line.split(",")
                 if len(parts) == 2 and parts[1].strip() not in (".", ""):
                     results[label] = {"date": parts[0], "value": parts[1].strip()}
                     break
-        return results
-    except Exception as e:
-        return {"error": str(e)}
+        except Exception as e:
+            results[label] = {"error": str(e)}
+    return results
 
 
 if __name__ == "__main__":
