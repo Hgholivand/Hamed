@@ -7,6 +7,7 @@ Usage:
     python3 market_fetcher.py --insider TICKER
     python3 market_fetcher.py --alpha TICKER
     python3 market_fetcher.py --macro
+    python3 market_fetcher.py --size TICKER PORTFOLIO_VALUE [SIGNALS_COUNT]
 """
 
 import sys
@@ -59,7 +60,6 @@ def fetch(ticker):
         pct_from_high = round((price - high_52w) / high_52w * 100, 1) if high_52w else None
         pct_from_low = round((price - low_52w) / low_52w * 100, 1) if low_52w else None
 
-        # MACD crossover detection
         macd_df = ta.macd(close)
         macd_signal = None
         if macd_df is not None and not macd_df.empty:
@@ -94,7 +94,6 @@ def fetch(ticker):
         if low_52w and pct_from_low is not None and pct_from_low < 10:
             ta_signals.append("NEAR_52W_LOW")
 
-        # Next earnings date
         cal = stock.calendar
         next_earnings = None
         if cal is not None and not cal.empty:
@@ -192,7 +191,6 @@ def fetch_alpha_vantage_sentiment(ticker):
         key = env.get("ALPHA_VANTAGE_KEY", "")
         if not key:
             return {"error": "ALPHA_VANTAGE_KEY not set in /home/ubuntu/.market_env"}
-        # Alpha Vantage uses base ticker without exchange suffix (SHOP not SHOP.TO)
         av_ticker = ticker.split(".")[0] if "." in ticker else ticker
         url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={av_ticker}&limit=10&apikey={key}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -260,17 +258,12 @@ def fetch_macro():
                     today_val = round(float(vals.iloc[-1]), 4)
                     prev_val = round(float(vals.iloc[-2]), 4)
                     change = round((today_val - prev_val) / prev_val * 100, 2)
-                    results[label] = {
-                        "value": today_val,
-                        "change_pct": change,
-                        "symbol": sym
-                    }
+                    results[label] = {"value": today_val, "change_pct": change, "symbol": sym}
                 elif len(vals) == 1:
                     results[label] = {"value": round(float(vals.iloc[-1]), 4), "symbol": sym}
             except Exception as e:
                 results[label] = {"error": str(e)}
 
-        # Add simple risk interpretation
         risk_flags = []
         if "vix" in results and "value" in results["vix"]:
             vix = results["vix"]["value"]
@@ -295,15 +288,123 @@ def fetch_macro():
         return {"error": str(e)}
 
 
+def fetch_position_size(ticker, portfolio_cad, signals_count=2):
+    """
+    Suggest position size for a TFSA buy.
+    portfolio_cad: total portfolio value in CAD
+    signals_count: number of buy signals triggering this (1, 2, or 3+)
+    """
+    try:
+        import yfinance as yf
+
+        # Get current price and currency
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        hist = stock.history(period="5d")
+        if hist.empty:
+            return {"error": f"No price data for {ticker}"}
+
+        price_native = info.get("currentPrice") or info.get("regularMarketPrice") or float(hist["Close"].iloc[-1])
+        currency = info.get("currency", "USD")
+
+        # Convert price to CAD if USD stock
+        cad_usd = 0.73  # fallback
+        try:
+            fx_hist = yf.Ticker("CADUSD=X").history(period="2d")
+            if not fx_hist.empty:
+                cad_usd = float(fx_hist["Close"].iloc[-1])
+        except Exception:
+            pass
+
+        if currency == "USD":
+            price_cad = round(price_native / cad_usd, 2)
+            fx_note = f"USD stock: ${price_native} USD = ${price_cad} CAD (rate: {round(cad_usd, 4)})"
+        else:
+            price_cad = round(price_native, 2)
+            fx_note = "CAD stock: no FX conversion needed"
+
+        # Get VIX for volatility adjustment
+        vix = 20.0  # fallback
+        try:
+            vix_hist = yf.Ticker("^VIX").history(period="2d")
+            if not vix_hist.empty:
+                vix = float(vix_hist["Close"].iloc[-1])
+        except Exception:
+            pass
+
+        # Base allocation: 5% of portfolio per position (TFSA conservative)
+        base_pct = 0.05
+
+        # Signal strength adjustment (never exceed 5%)
+        if signals_count >= 3:
+            signal_pct = 0.05   # full 5% — strong conviction
+        elif signals_count == 2:
+            signal_pct = 0.04   # 4% — moderate conviction
+        else:
+            signal_pct = 0.03   # 3% — single signal, cautious
+
+        # VIX volatility adjustment
+        if vix >= 40:
+            vix_mult = 0.4
+            vix_note = f"EXTREME FEAR (VIX={round(vix,1)}): position halved twice"
+        elif vix >= 30:
+            vix_mult = 0.6
+            vix_note = f"HIGH VOLATILITY (VIX={round(vix,1)}): position reduced 40%"
+        elif vix >= 25:
+            vix_mult = 0.8
+            vix_note = f"ELEVATED VOLATILITY (VIX={round(vix,1)}): position reduced 20%"
+        else:
+            vix_mult = 1.0
+            vix_note = f"NORMAL VOLATILITY (VIX={round(vix,1)}): no reduction"
+
+        final_pct = round(min(signal_pct * vix_mult, base_pct), 4)
+        position_cad = round(portfolio_cad * final_pct, 2)
+        shares = int(position_cad / price_cad)
+        actual_cost_cad = round(shares * price_cad, 2)
+
+        stop_loss_native = round(price_native * 0.93, 2)
+        target_native = round(price_native * 1.12, 2)
+        stop_loss_cad = round(stop_loss_native / cad_usd, 2) if currency == "USD" else stop_loss_native
+        target_cad = round(target_native / cad_usd, 2) if currency == "USD" else target_native
+        max_loss_cad = round(actual_cost_cad * 0.07, 2)
+        potential_gain_cad = round(actual_cost_cad * 0.12, 2)
+
+        return {
+            "ticker": ticker,
+            "price_native": price_native,
+            "price_cad": price_cad,
+            "currency": currency,
+            "fx_note": fx_note,
+            "portfolio_cad": portfolio_cad,
+            "signals_count": signals_count,
+            "vix": round(vix, 1),
+            "vix_note": vix_note,
+            "allocation_pct": round(final_pct * 100, 2),
+            "position_value_cad": position_cad,
+            "suggested_shares": shares,
+            "actual_cost_cad": actual_cost_cad,
+            "stop_loss": stop_loss_native,
+            "target": target_native,
+            "max_loss_cad": max_loss_cad,
+            "potential_gain_cad": potential_gain_cad,
+            "risk_reward": f"1 : {round(potential_gain_cad / max_loss_cad, 1) if max_loss_cad else 'N/A'}"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
-        print(json.dumps({"error": "Usage: market_fetcher.py TICKER1 TICKER2 ... or --fg or --insider TICKER or --alpha TICKER or --macro"}))
+        print(json.dumps({"error": "Usage: market_fetcher.py TICKER1 TICKER2 ... or --fg or --insider TICKER or --alpha TICKER or --macro or --size TICKER PORTFOLIO_CAD [SIGNALS]"})) 
         sys.exit(1)
-    if args[0] == "--insider" and len(sys.argv) == 3:
-        print(json.dumps(fetch_insider_trades(sys.argv[2]), indent=2))
-    elif args[0] == "--alpha" and len(sys.argv) == 3:
-        print(json.dumps(fetch_alpha_vantage_sentiment(sys.argv[2]), indent=2))
+    if args[0] == "--insider" and len(args) == 2:
+        print(json.dumps(fetch_insider_trades(args[1]), indent=2))
+    elif args[0] == "--alpha" and len(args) == 2:
+        print(json.dumps(fetch_alpha_vantage_sentiment(args[1]), indent=2))
+    elif args[0] == "--size" and len(args) >= 3:
+        signals = int(args[3]) if len(args) >= 4 else 2
+        print(json.dumps(fetch_position_size(args[1], float(args[2]), signals), indent=2))
     elif args == ["--fg"]:
         print(json.dumps({"fear_and_greed": fetch_fear_greed()}, indent=2))
     elif args == ["--macro"]:
