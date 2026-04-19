@@ -6,7 +6,7 @@ Usage:
     python3 market_fetcher.py --fg
     python3 market_fetcher.py --insider TICKER
     python3 market_fetcher.py --alpha TICKER
-    python3 market_fetcher.py --fred
+    python3 market_fetcher.py --macro
 """
 
 import sys
@@ -229,36 +229,76 @@ def fetch_alpha_vantage_sentiment(ticker):
         return {"error": str(e)}
 
 
-def fetch_fred_macro():
-    """US macro indicators from FRED (free, no API key required)."""
-    series = {
-        "fed_funds_rate": "FEDFUNDS",
-        "cpi_yoy": "CPIAUCSL",
-        "unemployment": "UNRATE",
-        "10y_treasury": "GS10",
-        "us_gdp_growth": "A191RL1Q225SBEA",
-    }
-    results = {}
-    for label, sid in series.items():
-        try:
-            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=25) as r:
-                lines = r.read().decode().strip().split("\n")
-            for line in reversed(lines[1:]):
-                parts = line.split(",")
-                if len(parts) == 2 and parts[1].strip() not in (".", ""):
-                    results[label] = {"date": parts[0], "value": parts[1].strip()}
-                    break
-        except Exception as e:
-            results[label] = {"error": str(e)}
-    return results
+def fetch_macro():
+    """Market-traded macro indicators via yfinance (free, works from EC2)."""
+    try:
+        import yfinance as yf
+
+        symbols = {
+            "10y_treasury_yield": "^TNX",
+            "vix": "^VIX",
+            "sp500": "^GSPC",
+            "nasdaq": "^IXIC",
+            "tsx_composite": "^GSPTSE",
+            "usd_index": "DX-Y.NYB",
+            "cad_usd": "CADUSD=X",
+            "gold": "GC=F",
+            "crude_oil": "CL=F",
+        }
+
+        results = {}
+        tickers = yf.download(
+            list(symbols.values()), period="2d", interval="1d",
+            progress=False, auto_adjust=True
+        )
+        close = tickers["Close"] if "Close" in tickers.columns else tickers
+
+        for label, sym in symbols.items():
+            try:
+                vals = close[sym].dropna()
+                if len(vals) >= 2:
+                    today_val = round(float(vals.iloc[-1]), 4)
+                    prev_val = round(float(vals.iloc[-2]), 4)
+                    change = round((today_val - prev_val) / prev_val * 100, 2)
+                    results[label] = {
+                        "value": today_val,
+                        "change_pct": change,
+                        "symbol": sym
+                    }
+                elif len(vals) == 1:
+                    results[label] = {"value": round(float(vals.iloc[-1]), 4), "symbol": sym}
+            except Exception as e:
+                results[label] = {"error": str(e)}
+
+        # Add simple risk interpretation
+        risk_flags = []
+        if "vix" in results and "value" in results["vix"]:
+            vix = results["vix"]["value"]
+            if vix > 30:
+                risk_flags.append(f"HIGH_VOLATILITY (VIX={vix})")
+            elif vix < 15:
+                risk_flags.append(f"LOW_VOLATILITY (VIX={vix})")
+        if "10y_treasury_yield" in results and "value" in results["10y_treasury_yield"]:
+            y = results["10y_treasury_yield"]["value"]
+            if y > 4.5:
+                risk_flags.append(f"HIGH_RATES (10Y={y}%)")
+        if "cad_usd" in results and "value" in results["cad_usd"]:
+            fx = results["cad_usd"]["value"]
+            if fx < 0.72:
+                risk_flags.append(f"WEAK_CAD (FX={fx}) — FX headwind on USD stocks")
+            elif fx > 0.76:
+                risk_flags.append(f"STRONG_CAD (FX={fx}) — FX tailwind on USD stocks")
+
+        results["risk_flags"] = risk_flags
+        return results
+    except Exception as e:
+        return {"error": str(e)}
 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
-        print(json.dumps({"error": "Usage: market_fetcher.py TICKER1 TICKER2 ... or --fg or --insider TICKER or --alpha TICKER or --fred"}))
+        print(json.dumps({"error": "Usage: market_fetcher.py TICKER1 TICKER2 ... or --fg or --insider TICKER or --alpha TICKER or --macro"}))
         sys.exit(1)
     if args[0] == "--insider" and len(sys.argv) == 3:
         print(json.dumps(fetch_insider_trades(sys.argv[2]), indent=2))
@@ -266,7 +306,7 @@ if __name__ == "__main__":
         print(json.dumps(fetch_alpha_vantage_sentiment(sys.argv[2]), indent=2))
     elif args == ["--fg"]:
         print(json.dumps({"fear_and_greed": fetch_fear_greed()}, indent=2))
-    elif args == ["--fred"]:
-        print(json.dumps({"macro": fetch_fred_macro()}, indent=2))
+    elif args == ["--macro"]:
+        print(json.dumps({"macro": fetch_macro()}, indent=2))
     else:
         print(json.dumps({t: fetch(t) for t in args}, indent=2))
